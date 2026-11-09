@@ -1,0 +1,5 @@
+.build/
+models/
+test_audio_16k.wav
+Package.resolved
+.venv/
