@@ -21,9 +21,11 @@ let aligner: CoreMLForcedAligner
 if mode == "default" {
     aligner = try CoreMLForcedAligner.fromDirectory(modelDirectory)
 } else {
-    let unitsByMode: [String: MLComputeUnits] = ["all": .all, "cpu": .cpuOnly, "gpu": .cpuAndGPU]
+    let unitsByMode: [String: MLComputeUnits] = [
+        "all": .all, "cpu": .cpuOnly, "gpu": .cpuAndGPU, "ne": .cpuAndNeuralEngine,
+    ]
     guard let computeUnits = unitsByMode[mode] else {
-        fatalError("unknown mode \(mode); use default, all, cpu or gpu")
+        fatalError("unknown mode \(mode); use default, all, cpu, gpu or ne")
     }
     aligner = try CoreMLForcedAligner.fromDirectory(
         modelDirectory,
