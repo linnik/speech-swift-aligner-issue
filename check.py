@@ -29,11 +29,12 @@ audio, _ = sf.read("test_audio_16k.wav", dtype="float32")
 
 # 2. The CoreML INT8 bundle, compiled files only.
 bundle = "models/coreml-int8"
-if not os.path.isdir(f"{bundle}/text_decoder.mlmodelc"):
+if not os.path.isdir(f"{bundle}/text_decoder_ane_v1.mlmodelc"):
     snapshot_download(
         "aufklarer/Qwen3-ForcedAligner-0.6B-CoreML-INT8",
         local_dir=bundle,
-        allow_patterns=["audio_encoder.mlmodelc/*", "text_decoder.mlmodelc/*", "embed_tokens.fp16.bin",
+        allow_patterns=["audio_encoder.mlmodelc/*", "text_decoder.mlmodelc/*", "text_decoder_ane_v1.mlmodelc/*",
+                        "text_decoder_cpu_v1.mlmodelc/*", "embed_tokens.fp16.bin",
                         "config.json", "vocab.json", "merges.txt", "tokenizer_config.json"],
     )
 
@@ -77,27 +78,39 @@ with torch.no_grad():
     audio_features = model.model.get_audio_features(torch.tensor(padded_mel), torch.tensor(mask))
 audio_embeddings = audio_features.pooler_output.reshape(-1, 1024).numpy()
 
-# 5. speech-swift's prompt: chat prefix, one audio pad per audio embedding, suffix, then word<timestamp><timestamp>
-#    per word. The audio embeddings replace the pads.
-prefix = [151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669]
-suffix = [151670, 151645, 198, 151644, 77091, 198]
+# 5. Two prompts, each followed by word<timestamp><timestamp> per word. The audio embeddings replace the pads.
+#    Qwen's: <audio_start> pads <audio_end>, as qwen_asr's encode_timestamp builds it. This is the reference.
+#    speech-swift's: the same audio wrapped in a chat template (system, user and assistant turns).
 audio_pad, timestamp = 151676, 151705
+prompts = {
+    "qwen": ([151669], [151670]),
+    "chat": ([151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669], [151670, 151645, 198, 151644, 77091, 198]),
+}
 words = processor.split_words_for_alignment(text, "English")
 slotted_words = processor.tokenizer.encode("".join(word + "<timestamp><timestamp>" for word in words),
                                            add_special_tokens=False)
-ids = prefix + [audio_pad] * len(audio_embeddings) + suffix + slotted_words
-slots = [i for i, token in enumerate(ids) if token == timestamp]
+table = model.model.language_model.embed_tokens.weight.detach().numpy()
 
-embeddings = model.model.language_model.embed_tokens.weight.detach().numpy()[ids].copy()
-embeddings[len(prefix):len(prefix) + len(audio_embeddings)] = audio_embeddings
+
+def prompt_inputs(prefix, suffix):
+    ids = prefix + [audio_pad] * len(audio_embeddings) + suffix + slotted_words
+    embeddings = table[ids].copy()
+    embeddings[len(prefix):len(prefix) + len(audio_embeddings)] = audio_embeddings
+    return ids, embeddings, [i for i, token in enumerate(ids) if token == timestamp]
+
 
 # 6. PyTorch timestamp classes at the slots: two per word (start, end), one class is 80 ms.
 #    transformers' _fix_timestamps makes them run in order, as speech-swift's TimestampCorrection does.
-with torch.no_grad():
-    hidden = model.model.language_model(inputs_embeds=torch.tensor(embeddings)[None]).last_hidden_state
-    reference_logits = model.score(hidden)[0].numpy()[slots]
-reference = reference_logits.argmax(-1)
-reference_starts = [f"{index * 0.08:.2f}" for index in _fix_timestamps(reference)[0::2]]
+pytorch = {}
+for name, (prefix, suffix) in prompts.items():
+    ids, embeddings, slots = prompt_inputs(prefix, suffix)
+    with torch.no_grad():
+        hidden = model.model.language_model(inputs_embeds=torch.tensor(embeddings)[None]).last_hidden_state
+        logits = model.score(hidden)[0].numpy()[slots]
+    pytorch[name] = (ids, embeddings, slots, logits, logits.argmax(-1))
+ids, embeddings, slots, reference_logits, reference = pytorch["qwen"]
+reference_starts = {name: [f"{index * 0.08:.2f}" for index in _fix_timestamps(result[4])[0::2]]
+                    for name, result in pytorch.items()}
 
 # 7. Swift, per compute-unit mode. With ALIGN_DEBUG=1, CoreMLForcedAligner prints its raw indices;
 #    its normal output is one "start word" line per word, after TimestampCorrection.
@@ -111,18 +124,20 @@ for mode in ["default", "all", "cpu", "gpu"]:
     swift_raw[mode] = [int(index) for index in raw_line.split(",")]
     swift_starts[mode] = [line.split()[0] for line in result.stdout.splitlines() if not line.startswith("[")]
 
-print("Raw timestamp indices, two per word (start, end), 80 ms each:")
-print(f"  {'PyTorch':8} {reference.tolist()}")
+print("Raw timestamp indices, two per word (start, end), 80 ms each. PyTorch with Qwen's prompt is the reference:")
+for name in pytorch:
+    print(f"  {'PyTorch, ' + name:15} {pytorch[name][4].tolist()}")
 for mode, raw in swift_raw.items():
     same = sum(swift == torch_index for swift, torch_index in zip(raw, reference))
-    print(f"  {mode:8} {raw}  {same}/{len(reference)} equal to PyTorch")
+    print(f"  {mode:15} {raw}  {same}/{len(reference)} equal to PyTorch, qwen")
 
 print("\nWord starts in seconds, after putting the times in order:")
-print(f"  {'PyTorch':8} {' '.join(reference_starts)}")
+for name, starts in reference_starts.items():
+    print(f"  {'PyTorch, ' + name:15} {' '.join(starts)}")
 for mode, starts in swift_starts.items():
-    print(f"  {mode:8} {' '.join(starts)}")
+    print(f"  {mode:15} {' '.join(starts)}")
 
-# 8. The bundle alone in coremltools, fed the reference mel and prompt, so only the compute unit varies.
+# 8. The bundle alone in coremltools, fed the reference mel and Qwen's prompt, so only the compute unit varies.
 #    Inputs are padded as speech-swift pads them: 3000 mel frames, 768 tokens.
 mel_input = np.zeros((1, 128, 3000), np.float32)
 mel_input[0, :, :frames] = mel

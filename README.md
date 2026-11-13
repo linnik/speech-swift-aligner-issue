@@ -16,12 +16,14 @@ uv run check.py
 2. Downloads the INT8 bundle, compiled files only.
 3. Loads the PyTorch model. The checkpoint needs a hand-built config and renamed weights for transformers.
 4. Computes the reference mel features and audio embeddings.
-5. Builds speech-swift's prompt: chat prefix, audio pads, suffix, then `word<timestamp><timestamp>` per word.
-6. Gets PyTorch's timestamp classes at the slots.
+5. Builds Qwen's prompt and speech-swift's chat-template prompt, then `word<timestamp><timestamp>` per word.
+6. Gets PyTorch's timestamp classes at the slots for both. Qwen's prompt is the reference.
 7. Runs `Sources/aligncheck/main.swift` per compute-unit mode, and compares its raw indices with PyTorch.
 8. Runs the bundle alone in coremltools with the reference inputs, per compute unit.
 
 ## v0.0.29
+
+This section and the next two used speech-swift's chat prompt as the reference. See [Qwen's prompt](#qwens-prompt).
 
 ```
 Raw timestamp indices, two per word (start, end), 80 ms each:
@@ -123,3 +125,19 @@ mul(x) on CPU_AND_NE            9        1     0.25  0.00999        0  0.00999  
 
 On the Neural Engine `pow(x, 2)` returns 1 for every negative `x`. The 0.8% are the inputs near −1, whose square
 is 1. The aligner's text decoder squares with `pow` in its RMSNorm chains, which is why `all` is still wrong.
+
+## Qwen's prompt
+
+speech-swift wraps the aligner's audio in a chat template. Qwen's code doesn't
+([`encode_timestamp`](https://github.com/QwenLM/Qwen3-ASR/blob/c17a131fe028b2e428b6e80a33d30bb4fa57b8df/qwen_asr/inference/qwen3_forced_aligner.py#L249-L250)).
+Word starts in seconds:
+
+```
+  PyTorch, qwen   5.20 5.36 5.44 6.08 6.24 6.32 6.96 7.28 7.36 7.44 7.84
+  PyTorch, chat   5.28 5.52 5.52 6.16 6.80 6.88 7.04 7.36 7.44 8.00 8.40
+  main            5.28 5.52 5.52 6.16 6.80 6.88 7.04 7.36 7.44 8.00 8.40
+  fix             5.20 5.36 5.44 6.08 6.24 6.32 6.96 7.28 7.36 7.44 7.84
+```
+
+`main` is `31d676c`, `fix` is [`fix/aligner-bare-prompt`](https://github.com/linnik/speech-swift/tree/fix/aligner-bare-prompt).
+All compute units agree. The speech ends at about 8.36 s, so with the chat prompt "tomorrow?" starts in silence.
